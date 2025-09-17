@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-main.py - SmartAPI market scanner (fixed: single startup login + polling loop)
-
-Changes vs previous:
-- Login is performed exactly once at startup; the returned JWT is passed into the polling loop.
-- Avoids repeated login attempts that caused "access rate" errors.
-- Rest of functionality: manual instrument tokens, LTP + last ~50 candles, chart PNG, Telegram alerts.
+main.py - SmartAPI market scanner
+- Single startup login (MPIN+TOTP preferred) -> reuse JWT in polling loop
+- Auto-download instruments master JSON to resolve tokens for indices
+- Poll indices every MARKET_POLL_INTERVAL_SECONDS (default 300s)
+- For each: fetch LTP and last ~50 candles, render chart PNG, send Telegram text+image alert
+- Simple alert rule (change vs prev candle)
 """
 
 import os
@@ -16,6 +16,7 @@ import logging
 import importlib
 import traceback
 import requests
+import json
 
 from dotenv import load_dotenv
 
@@ -44,19 +45,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 POLL_INTERVAL = int(os.getenv("MARKET_POLL_INTERVAL_SECONDS", "300"))  # default 300s = 5min
 BASE_API_HOST = os.getenv("SMARTAPI_BASE_URL", "https://apiconnect.angelone.in")
 
-# ---------------- MANUAL INSTRUMENT TOKENS ----------------
+# Instruments master URL (AngelOne docs)
+INSTRUMENTS_URL = os.getenv("INSTRUMENTS_URL",
+                            "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json")
+
+# ---------------- DEFAULTS (will try to auto-resolve) ----------------
+# Keep token=None to let auto-resolve fill it. Manual token overrides can be typed here.
 INSTRUMENTS = {
-    "NIFTY50":   {"exchange": "NSE", "symbol": "NIFTY 50",  "token": "99926000"},
-    "BANKNIFTY": {"exchange": "NSE", "symbol": "BANKNIFTY",  "token": "99926009"},
-    "SENSEX":    {"exchange": "BSE", "symbol": "SENSEX",     "token": "1"},  # try "99919000" if 1 doesn't work
+    "NIFTY50":   {"exchange": "NSE", "symbol": "NIFTY 50",  "token": None},
+    "BANKNIFTY": {"exchange": "NSE", "symbol": "BANKNIFTY",  "token": None},
+    "SENSEX":    {"exchange": "BSE", "symbol": "SENSEX",     "token": None},
 }
-# -----------------------------------------------
 
 # ---------------- SmartConnect import ----------------
 SmartConnect = None
 for candidate in ("smartapi", "SmartApi", "smartapi_python"):
     try:
         mod = importlib.import_module(candidate)
+        # try common exposures
         if hasattr(mod, "SmartConnect"):
             SmartConnect = getattr(mod, "SmartConnect")
             logger.info("Using SmartConnect from module '%s'", candidate)
@@ -88,7 +94,7 @@ try:
 except Exception:
     pyotp = None
 
-# ---------------- Login helpers ----------------
+# ---------------- Utilities / Login ----------------
 def totp_now(secret):
     if not pyotp or not secret:
         return None
@@ -111,7 +117,7 @@ def _extract_jwt_from_resp(resp):
         return None
 
 def login():
-    """Login and return (resp_dict, jwt_token_string_or_None)."""
+    """Attempt MPIN+TOTP first, then password+TOTP fallback. Return (resp, jwt)."""
     if SMARTAPI_MPIN and SMARTAPI_TOTP_SECRET:
         code = totp_now(SMARTAPI_TOTP_SECRET)
         try:
@@ -136,6 +142,86 @@ def login():
             logger.debug(traceback.format_exc())
     logger.error("No valid credentials for login found (MPIN/password/TOTP).")
     return None, None
+
+# ---------------- Instruments master download & resolve ----------------
+def resolve_instruments_from_master():
+    """
+    Download instrument master JSON (OpenAPIScripMaster.json) and map desired indices to tokens.
+    Updates INSTRUMENTS in-place for NIFTY50, BANKNIFTY, SENSEX if found.
+    """
+    try:
+        logger.info("Downloading instruments master from %s", INSTRUMENTS_URL)
+        r = requests.get(INSTRUMENTS_URL, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        logger.exception("Failed to download or parse instruments master JSON")
+        return None
+
+    # expected 'data' is list of dicts; keys: 'symbol'/'tradingsymbol', 'exchange', 'token', etc.
+    if not isinstance(data, (list, tuple)):
+        # some endpoints wrap in { "data": [...] }
+        if isinstance(data, dict) and isinstance(data.get("data"), (list, tuple)):
+            rows = data.get("data")
+        else:
+            rows = []
+    else:
+        rows = data
+
+    logger.info("Downloaded instruments master rows=%d", len(rows))
+
+    # mapping of string to our keys; sometimes symbol values differ; check common variants
+    wanted_map = {
+        "NIFTY 50": "NIFTY50",
+        "NIFTY50": "NIFTY50",
+        "BANKNIFTY": "BANKNIFTY",
+        "BANK NIFTY": "BANKNIFTY",
+        "SENSEX": "SENSEX",
+        "S&P BSE SENSEX": "SENSEX",
+    }
+
+    found = {}
+    # iterate rows and try to find matches
+    for row in rows:
+        try:
+            # many masters use 'symbol' or 'tradingsymbol'
+            trad_sym = (row.get("symbol") or row.get("tradingsymbol") or "").strip()
+            exch = (row.get("exchange") or row.get("exch") or "").strip()
+            token = row.get("token") or row.get("instrument_token") or row.get("symboltoken") or row.get("tokenId")
+            # some masters store token as string/number; normalize to str
+            if token is None:
+                # try other keys
+                for k, v in row.items():
+                    if "token" in str(k).lower():
+                        token = v
+                        break
+            if token is None:
+                continue
+            # normalize trad_sym for matching
+            key = None
+            if trad_sym in wanted_map:
+                key = wanted_map[trad_sym]
+            else:
+                # try case-insensitive contains
+                for candidate, mapped in wanted_map.items():
+                    if candidate.lower() in trad_sym.lower():
+                        key = mapped
+                        break
+            if key:
+                found[key] = {"exchange": exch, "symbol": trad_sym, "token": str(token)}
+        except Exception:
+            continue
+
+    if found:
+        # update INSTRUMENTS for keys present
+        for k, v in found.items():
+            INSTRUMENTS[k]["exchange"] = v.get("exchange", INSTRUMENTS.get(k, {}).get("exchange"))
+            INSTRUMENTS[k]["symbol"] = v.get("symbol", INSTRUMENTS.get(k, {}).get("symbol"))
+            INSTRUMENTS[k]["token"] = v.get("token")
+        logger.info("Resolved instruments from master: %s", {k: INSTRUMENTS[k]["token"] for k in INSTRUMENTS})
+    else:
+        logger.warning("No desired instruments resolved from master; tokens remain as-is.")
+    return found
 
 # ---------------- Telegram helpers ----------------
 def telegram_send_text(text):
@@ -173,6 +259,9 @@ def telegram_send_photo(photo_path, caption=None):
 
 # ---------------- Market data helpers (SDK-first, REST fallback) ----------------
 def get_ltp(info, jwt_token=None):
+    """
+    info: either dict with token/exchange or a token string
+    """
     try:
         if hasattr(s, "getLtp"):
             return s.getLtp(info)
@@ -182,7 +271,7 @@ def get_ltp(info, jwt_token=None):
             return s.getLtpData([info])
     except Exception:
         logger.debug("SDK get_ltp failed", exc_info=True)
-    # REST fallback
+
     if not jwt_token:
         logger.debug("No JWT for REST LTP fallback")
         return None
@@ -203,6 +292,9 @@ def get_ltp(info, jwt_token=None):
         return None
 
 def get_candles(info, jwt_token=None, interval="5minute", from_ts=None, to_ts=None):
+    """
+    Request historical candles. SDK method names vary; try multiple names, else REST fallback.
+    """
     try:
         if hasattr(s, "getCandleData"):
             return s.getCandleData(info, interval, from_ts, to_ts)
@@ -212,7 +304,7 @@ def get_candles(info, jwt_token=None, interval="5minute", from_ts=None, to_ts=No
             return s.getHistoricalData(info, interval, from_ts, to_ts)
     except Exception:
         logger.debug("SDK get_candles failed", exc_info=True)
-    # REST fallback
+
     if not jwt_token:
         logger.debug("No JWT for REST candles fallback")
         return None
@@ -241,12 +333,15 @@ def plot_candles_ohlc(ohlc_list, title, filepath):
         width = 0.6
         fig, ax = plt.subplots(figsize=(10,5))
         ax.set_title(title)
+        ax.set_xlabel("Candle")
+        ax.set_ylabel("Price")
         for xi, o, h, l, c in zip(x, opens, highs, lows, closes):
             ax.plot([xi, xi], [l, h], linewidth=1, color='black')
-            lower = min(o,c)
-            height = abs(c-o)
+            lower = min(o, c)
+            height = abs(c - o)
             color = 'green' if c >= o else 'red'
-            rect = Rectangle((xi - width/2, lower), width, height if height>0 else 0.0001, facecolor=color, edgecolor='black')
+            rect = Rectangle((xi - width/2, lower), width, height if height > 0 else 0.0001,
+                             facecolor=color, edgecolor='black')
             ax.add_patch(rect)
         ax.set_xlim(-1, len(x))
         pad = (max(highs) - min(lows)) * 0.05
@@ -267,7 +362,7 @@ def simple_alert_rule(name, ltp, candles):
             return "NO_DATA", f"{name}: No candle data available"
         last = float(candles[-1]["close"])
         prev = float(candles[-2]["close"])
-        change_pct = (last - prev)/prev * 100.0 if prev != 0 else 0.0
+        change_pct = (last - prev) / prev * 100.0 if prev != 0 else 0.0
         sig = "NEUTRAL"
         if change_pct > 0.5:
             sig = "BULLISH"
@@ -279,7 +374,7 @@ def simple_alert_rule(name, ltp, candles):
         logger.exception("simple_alert_rule failed")
         return "ERROR", ""
 
-# ---------------- main polling loop ----------------
+# ---------------- polling loop ----------------
 def fetch_and_alert_loop(jwt_token):
     """
     Polling loop that uses the provided jwt_token (no internal login).
@@ -301,8 +396,14 @@ def fetch_and_alert_loop(jwt_token):
         logger.info("Polling at %s", ts)
         for name, info in INSTRUMENTS.items():
             try:
+                # check token presence
+                if not info.get("token"):
+                    logger.warning("Skipping %s - token missing", name)
+                    telegram_send_text(f"{name}\nSignal: NO_DATA\n{name}: token missing - could not fetch data")
+                    continue
+
                 ltp_res = get_ltp(info, jwt_token)
-                # try to extract a scalar LTP
+                # extract scalar LTP
                 ltp_val = None
                 if isinstance(ltp_res, dict):
                     ltp_val = ltp_res.get("data") or ltp_res.get("ltp") or ltp_res.get("lastPrice") or ltp_res.get("LTP")
@@ -311,7 +412,8 @@ def fetch_and_alert_loop(jwt_token):
                 elif isinstance(ltp_res, (int, float, str)):
                     ltp_val = ltp_res
                 else:
-                    ltp_val = str(ltp_res)[:100]
+                    ltp_val = str(ltp_res)[:200]
+
                 candles_res = get_candles(info, jwt_token, interval="5minute")
                 candles = []
                 # normalize to list of dicts
@@ -353,11 +455,26 @@ if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram vars missing; alerts will not be sent (set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID)")
 
-    # Do a single startup login and reuse the JWT in the loop
+    # 1) Attempt to auto-resolve instruments from remote master JSON
+    try:
+        resolved = resolve_instruments_from_master()
+        if resolved:
+            logger.info("Instruments resolved from master: %s", resolved)
+            # optionally send summary to Telegram for debugging
+            try:
+                telegram_send_text(f"Instrument tokens auto-resolved: {json.dumps({k: INSTRUMENTS[k]['token'] for k in INSTRUMENTS}, indent=0)[:2000]}")
+            except Exception:
+                pass
+        else:
+            logger.info("No instruments resolved from master. If tokens missing you may need to set INSTRUMENTS tokens manually.")
+    except Exception:
+        logger.exception("resolve_instruments_from_master() raised an exception")
+
+    # 2) Single startup login, reuse JWT in loop
     resp, jwt_token = login()
     if not resp or not jwt_token:
         logger.error("Startup login failed. Check credentials and TOTP. Exiting.")
         sys.exit(1)
 
-    # Start the polling loop with the obtained JWT (no further login calls inside loop)
+    # 3) Start polling loop with obtained JWT
     fetch_and_alert_loop(jwt_token)
