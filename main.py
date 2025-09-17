@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-main.py - SmartAPI market scanner with manual instrument tokens (NIFTY, BANKNIFTY, SENSEX)
-- MPIN+TOTP login (preferred), fallback password+TOTP
-- Poll indices every MARKET_POLL_INTERVAL_SECONDS (default 300s)
-- Fetch LTP and last ~50 candles, render chart PNG, send Telegram text+image alert
-- Simple alert rule (change vs prev candle)
+main.py - SmartAPI market scanner (fixed: single startup login + polling loop)
+
+Changes vs previous:
+- Login is performed exactly once at startup; the returned JWT is passed into the polling loop.
+- Avoids repeated login attempts that caused "access rate" errors.
+- Rest of functionality: manual instrument tokens, LTP + last ~50 candles, chart PNG, Telegram alerts.
 """
 
 import os
@@ -44,12 +45,10 @@ POLL_INTERVAL = int(os.getenv("MARKET_POLL_INTERVAL_SECONDS", "300"))  # default
 BASE_API_HOST = os.getenv("SMARTAPI_BASE_URL", "https://apiconnect.angelone.in")
 
 # ---------------- MANUAL INSTRUMENT TOKENS ----------------
-# These tokens are commonly used examples for indices in some SmartAPI setups.
-# If any index returns no-data, try switching SENSEX token to the alternative below.
 INSTRUMENTS = {
     "NIFTY50":   {"exchange": "NSE", "symbol": "NIFTY 50",  "token": "99926000"},
     "BANKNIFTY": {"exchange": "NSE", "symbol": "BANKNIFTY",  "token": "99926009"},
-    "SENSEX":    {"exchange": "BSE", "symbol": "SENSEX",     "token": "1"},          # if no data try "99919000"
+    "SENSEX":    {"exchange": "BSE", "symbol": "SENSEX",     "token": "1"},  # try "99919000" if 1 doesn't work
 }
 # -----------------------------------------------
 
@@ -112,7 +111,7 @@ def _extract_jwt_from_resp(resp):
         return None
 
 def login():
-    """Login and return (resp_dict, jwt_token_str_or_None)."""
+    """Login and return (resp_dict, jwt_token_string_or_None)."""
     if SMARTAPI_MPIN and SMARTAPI_TOTP_SECRET:
         code = totp_now(SMARTAPI_TOTP_SECRET)
         try:
@@ -281,12 +280,14 @@ def simple_alert_rule(name, ltp, candles):
         return "ERROR", ""
 
 # ---------------- main polling loop ----------------
-def fetch_and_alert_loop():
-    # login
-    resp, jwt = login()
-    if not resp or not jwt:
-        logger.error("Login failed - aborting")
+def fetch_and_alert_loop(jwt_token):
+    """
+    Polling loop that uses the provided jwt_token (no internal login).
+    """
+    if not jwt_token:
+        logger.error("fetch_and_alert_loop requires a valid jwt_token")
         return
+
     # post startup message
     try:
         monitoring_list = ", ".join(list(INSTRUMENTS.keys()))
@@ -300,8 +301,7 @@ def fetch_and_alert_loop():
         logger.info("Polling at %s", ts)
         for name, info in INSTRUMENTS.items():
             try:
-                token_info = info
-                ltp_res = get_ltp(token_info, jwt)
+                ltp_res = get_ltp(info, jwt_token)
                 # try to extract a scalar LTP
                 ltp_val = None
                 if isinstance(ltp_res, dict):
@@ -312,7 +312,7 @@ def fetch_and_alert_loop():
                     ltp_val = ltp_res
                 else:
                     ltp_val = str(ltp_res)[:100]
-                candles_res = get_candles(token_info, jwt, interval="5minute")
+                candles_res = get_candles(info, jwt_token, interval="5minute")
                 candles = []
                 # normalize to list of dicts
                 if isinstance(candles_res, dict):
@@ -352,10 +352,12 @@ def fetch_and_alert_loop():
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram vars missing; alerts will not be sent (set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID)")
-    # quick login check
-    r, token = login()
-    if not r or not token:
+
+    # Do a single startup login and reuse the JWT in the loop
+    resp, jwt_token = login()
+    if not resp or not jwt_token:
         logger.error("Startup login failed. Check credentials and TOTP. Exiting.")
         sys.exit(1)
-    # start loop
-    fetch_and_alert_loop()
+
+    # Start the polling loop with the obtained JWT (no further login calls inside loop)
+    fetch_and_alert_loop(jwt_token)
