@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-main.py - SmartAPI market scanner with auto instrument fetch + Telegram alerts.
-
-Features:
-- MPIN + TOTP login (preferred), fallback to password+TOTP
-- Auto-resolve instrument tokens via SDK if possible
-- Send instrument diagnostics to Telegram (helps debug auto-resolve)
-- Poll configured indices every MARKET_POLL_INTERVAL_SECONDS (default 300)
-- For each: fetch LTP and last ~50 candles, render chart, send Telegram text+image alert
-- Simple alert rule (change vs prev candle). Replace with your own indicators easily.
+main.py - SmartAPI market scanner with manual instrument tokens (NIFTY, BANKNIFTY, SENSEX)
+- MPIN+TOTP login (preferred), fallback password+TOTP
+- Poll indices every MARKET_POLL_INTERVAL_SECONDS (default 300s)
+- Fetch LTP and last ~50 candles, render chart PNG, send Telegram text+image alert
+- Simple alert rule (change vs prev candle)
 """
 
 import os
@@ -19,8 +15,6 @@ import logging
 import importlib
 import traceback
 import requests
-import math
-import json
 
 from dotenv import load_dotenv
 
@@ -49,13 +43,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 POLL_INTERVAL = int(os.getenv("MARKET_POLL_INTERVAL_SECONDS", "300"))  # default 300s = 5min
 BASE_API_HOST = os.getenv("SMARTAPI_BASE_URL", "https://apiconnect.angelone.in")
 
-# default instruments to monitor (token None -> attempt auto-resolve)
+# ---------------- MANUAL INSTRUMENT TOKENS ----------------
+# These tokens are commonly used examples for indices in some SmartAPI setups.
+# If any index returns no-data, try switching SENSEX token to the alternative below.
 INSTRUMENTS = {
-    "NIFTY50": {"exchange": "NSE", "symbol": "NIFTY 50", "token": None},
-    "BANKNIFTY": {"exchange": "NSE", "symbol": "BANKNIFTY", "token": None},
-    "SENSEX": {"exchange": "BSE", "symbol": "SENSEX", "token": None},
-    # You can add specific stocks, e.g. "RELIANCE": {"exchange":"NSE","symbol":"RELIANCE","token":None}
+    "NIFTY50":   {"exchange": "NSE", "symbol": "NIFTY 50",  "token": "99926000"},
+    "BANKNIFTY": {"exchange": "NSE", "symbol": "BANKNIFTY",  "token": "99926009"},
+    "SENSEX":    {"exchange": "BSE", "symbol": "SENSEX",     "token": "1"},          # if no data try "99919000"
 }
+# -----------------------------------------------
 
 # ---------------- SmartConnect import ----------------
 SmartConnect = None
@@ -77,7 +73,7 @@ if SmartConnect is None:
     logger.error("SmartConnect import failed. Install 'smartapi-python' and ensure package present.")
     sys.exit(1)
 
-# create SmartConnect
+# create SmartConnect instance
 try:
     try:
         s = SmartConnect(api_key=SMARTAPI_API_KEY)
@@ -103,8 +99,20 @@ def totp_now(secret):
         logger.exception("TOTP generation failed")
         return None
 
+def _extract_jwt_from_resp(resp):
+    try:
+        if not resp or not isinstance(resp, dict):
+            return None
+        data = resp.get("data") or {}
+        jwt = data.get("jwtToken") or data.get("token") or data.get("jwt")
+        if isinstance(jwt, str) and jwt.startswith("Bearer "):
+            return jwt.split(" ", 1)[1]
+        return jwt
+    except Exception:
+        return None
+
 def login():
-    """Login and return tuple (resp_dict, jwt_token_string_or_None)."""
+    """Login and return (resp_dict, jwt_token_str_or_None)."""
     if SMARTAPI_MPIN and SMARTAPI_TOTP_SECRET:
         code = totp_now(SMARTAPI_TOTP_SECRET)
         try:
@@ -130,88 +138,7 @@ def login():
     logger.error("No valid credentials for login found (MPIN/password/TOTP).")
     return None, None
 
-def _extract_jwt_from_resp(resp):
-    try:
-        if not resp or not isinstance(resp, dict):
-            return None
-        data = resp.get("data") or {}
-        jwt = data.get("jwtToken") or data.get("token") or data.get("jwt")
-        if isinstance(jwt, str) and jwt.startswith("Bearer "):
-            return jwt.split(" ", 1)[1]
-        return jwt
-    except Exception:
-        return None
-
-# ---------------- Instruments auto-resolve ----------------
-def fetch_instruments_sdk():
-    """Try various SDK methods to fetch instrument master."""
-    try:
-        if hasattr(s, "get_instruments"):
-            return s.get_instruments()
-        if hasattr(s, "getInstruments"):
-            return s.getInstruments()
-        if hasattr(s, "instruments") and callable(s.instruments):
-            return s.instruments()
-    except Exception:
-        logger.debug("SDK instruments fetch failed", exc_info=True)
-    return None
-
-def resolve_instrument_tokens():
-    """Attempt to fill INSTRUMENTS[name]['token'] using SDK fetched master."""
-    data = fetch_instruments_sdk()
-    if not data:
-        logger.info("SDK did not return instruments (fetch_instruments_sdk() returned None).")
-        return data
-    # normalize to list of dicts
-    items = []
-    if isinstance(data, dict):
-        # dict may be keyed by symbol or token; gather values
-        for k, v in data.items():
-            if isinstance(v, dict):
-                v["_key"] = k
-                items.append(v)
-            else:
-                items.append({"_key": k, "value": v})
-    elif isinstance(data, (list, tuple)):
-        items = list(data)
-    else:
-        logger.info("Unknown instruments data format: %s", type(data))
-        return data
-
-    logger.info("Attempting to resolve tokens from fetched instruments (items=%d)", len(items))
-    for name, meta in INSTRUMENTS.items():
-        if meta.get("token"):
-            continue
-        want_sym = (meta.get("symbol") or "").lower()
-        want_ex = (meta.get("exchange") or "").lower()
-        found = None
-        for it in items:
-            try:
-                sym = str(it.get("symbol") or it.get("tradingsymbol") or it.get("name") or it.get("_key") or "").lower()
-                ex = str(it.get("exchange") or it.get("exch") or it.get("ex") or "").lower()
-                token = it.get("token") or it.get("instrument_token") or it.get("symboltoken") or it.get("tokenId") or it.get("instrumentToken")
-                # fallback: any key with 'token' in name
-                if not token:
-                    for k in it.keys():
-                        if "token" in str(k).lower():
-                            token = it.get(k)
-                            break
-                if not token:
-                    continue
-                if want_sym and want_sym in sym:
-                    if not want_ex or (want_ex and want_ex in ex):
-                        found = token
-                        break
-            except Exception:
-                continue
-        if found:
-            INSTRUMENTS[name]["token"] = found
-            logger.info("Resolved %s -> token %s", name, found)
-        else:
-            logger.info("Could not resolve token for %s automatically", name)
-    return data
-
-# ---------------- Diagnostics to Telegram ----------------
+# ---------------- Telegram helpers ----------------
 def telegram_send_text(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials missing; skipping send_text")
@@ -244,48 +171,6 @@ def telegram_send_photo(photo_path, caption=None):
     except Exception:
         logger.exception("telegram_send_photo failed")
         return False
-
-def send_instruments_diagnostics(instruments_data):
-    """Send a brief instruments dump (sample) to Telegram for debugging auto-resolve."""
-    try:
-        if not instruments_data:
-            telegram_send_text("Instruments diagnostics: (no data returned by SDK)")
-            logger.info("No instruments_data to send")
-            return
-        lines = []
-        # list or dict
-        if isinstance(instruments_data, dict):
-            count = 0
-            for k, v in list(instruments_data.items())[:80]:
-                if isinstance(v, dict):
-                    sym = v.get("symbol") or v.get("tradingsymbol") or v.get("name") or ""
-                    token = v.get("token") or v.get("instrument_token") or v.get("symboltoken") or ""
-                    ex = v.get("exchange") or v.get("exch") or ""
-                    lines.append(f"{k}|{ex}|{sym}|token={token}")
-                else:
-                    lines.append(f"{k} -> {str(v)[:100]}")
-                count += 1
-            header = f"Fetched instruments (dict) sample {count}"
-        elif isinstance(instruments_data, (list, tuple)):
-            count = 0
-            for it in instruments_data[:80]:
-                if isinstance(it, dict):
-                    sym = it.get("symbol") or it.get("tradingsymbol") or it.get("name") or ""
-                    token = it.get("token") or it.get("instrument_token") or it.get("symboltoken") or ""
-                    ex = it.get("exchange") or it.get("exch") or ""
-                    lines.append(f"{ex}|{sym}|token={token}")
-                else:
-                    lines.append(str(it)[:120])
-                count += 1
-            header = f"Fetched instruments (list) sample {count}"
-        else:
-            header = "Fetched instruments (unknown format)"
-            lines = [str(instruments_data)[:1000]]
-        payload = header + "\n" + "\n".join(lines[:60])
-        telegram_send_text(f"<pre>{payload}</pre>")
-        logger.info("Sent instruments diagnostics to Telegram")
-    except Exception:
-        logger.exception("send_instruments_diagnostics failed")
 
 # ---------------- Market data helpers (SDK-first, REST fallback) ----------------
 def get_ltp(info, jwt_token=None):
@@ -409,13 +294,6 @@ def fetch_and_alert_loop():
     except Exception:
         pass
 
-    # auto-resolve tokens and send diagnostics
-    instr_data = resolve_instrument_tokens()
-    if instr_data:
-        send_instruments_diagnostics(instr_data)
-    else:
-        telegram_send_text("Instruments auto-resolve returned no data; please populate INSTRUMENTS tokens manually if needed.")
-
     logger.info("Starting polling every %s seconds", POLL_INTERVAL)
     while True:
         ts = datetime.datetime.utcnow().isoformat()
@@ -427,7 +305,6 @@ def fetch_and_alert_loop():
                 # try to extract a scalar LTP
                 ltp_val = None
                 if isinstance(ltp_res, dict):
-                    # common keys
                     ltp_val = ltp_res.get("data") or ltp_res.get("ltp") or ltp_res.get("lastPrice") or ltp_res.get("LTP")
                     if isinstance(ltp_val, dict):
                         ltp_val = ltp_val.get("lp") or ltp_val.get("lastPrice")
@@ -437,7 +314,7 @@ def fetch_and_alert_loop():
                     ltp_val = str(ltp_res)[:100]
                 candles_res = get_candles(token_info, jwt, interval="5minute")
                 candles = []
-                # normalize to list of dicts with keys timestamp, open, high, low, close
+                # normalize to list of dicts
                 if isinstance(candles_res, dict):
                     data = candles_res.get("data") or candles_res.get("candles") or candles_res.get("result")
                     if isinstance(data, list) and data and isinstance(data[0], list):
@@ -475,16 +352,10 @@ def fetch_and_alert_loop():
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram vars missing; alerts will not be sent (set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID)")
-    # quick check login now
+    # quick login check
     r, token = login()
     if not r or not token:
         logger.error("Startup login failed. Check credentials and TOTP. Exiting.")
         sys.exit(1)
-    # attempt auto-resolve and send diagnostics
-    items = resolve_instrument_tokens()
-    if items:
-        send_instruments_diagnostics(items)
-    else:
-        logger.info("Auto-resolve returned no items - please set instrument tokens manually in INSTRUMENTS.")
     # start loop
     fetch_and_alert_loop()
