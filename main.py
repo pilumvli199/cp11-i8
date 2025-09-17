@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Updated main.py - enhanced REST LTP attempts (multiple endpoints) + diagnostics
-Phase1: LTP-only alerts every POLL_INTERVAL seconds to Telegram.
+main.py - Phase1 LTP alerts with API-Key-aware REST headers
 
-Replace your existing main.py with this file and deploy.
-Ensure .env contains: SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN (or SMARTAPI_PASSWORD),
-SMARTAPI_TOTP_SECRET, SMARTAPI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Changes:
+- Adds X-PrivateKey (SMARTAPI_API_KEY) and X-SourceID/X-UserType headers to REST requests.
+- Sends clearer Telegram diagnostics when API Key is invalid.
+- Rest of Phase1 logic: single startup login, resolve instruments, poll LTP every POLL_INTERVAL and send Telegram messages.
 """
 
 import os
@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(asctime)s %(me
 logger = logging.getLogger(__name__)
 
 # ENV
-SMARTAPI_API_KEY = os.getenv("SMARTAPI_API_KEY", "").strip()
+SMARTAPI_API_KEY = os.getenv("SMARTAPI_API_KEY", "").strip()  # <-- ensure this is correct
 SMARTAPI_CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "").strip()
 SMARTAPI_MPIN = os.getenv("SMARTAPI_MPIN", "").strip()
 SMARTAPI_PASSWORD = os.getenv("SMARTAPI_PASSWORD", "").strip()
@@ -147,7 +147,16 @@ def telegram_send_text(text):
         logger.exception("telegram_send_text failed")
         return False
 
-# ---------------- Instruments resolve (best-effort) ----------------
+# Helper to build API headers including API key
+def api_headers(jwt_token=None):
+    headers = {"Content-Type": "application/json", "X-SourceID": "WEB", "X-UserType": "USER"}
+    if SMARTAPI_API_KEY:
+        headers["X-PrivateKey"] = SMARTAPI_API_KEY
+    if jwt_token:
+        headers["Authorization"] = f"Bearer {jwt_token}"
+    return headers
+
+# Instruments resolve
 def resolve_instruments_from_master():
     try:
         logger.info("Downloading instruments master: %s", INSTRUMENTS_URL)
@@ -193,14 +202,11 @@ def resolve_instruments_from_master():
     logger.info("Instruments after resolve: %s", {k:INSTRUMENTS[k]["token"] for k in INSTRUMENTS})
     return found
 
-# ---------------- Enhanced REST LTP attempts ----------------
+# REST LTP attempts (with API key header)
 def rest_ltp_order_service(token, exchange, jwt_token):
-    """
-    Try POST /order-service/.../getLtpData with body [{"exchange":"NSE","symboltoken":"..."}]
-    """
     try:
         url = BASE_API_HOST.rstrip("/") + "/order-service/rest/secure/angelbroking/order/v1/getLtpData"
-        headers = {"Authorization": f"Bearer {jwt_token}", "Content-Type": "application/json"}
+        headers = api_headers(jwt_token)
         body = [{"exchange": exchange, "symboltoken": str(token)}]
         r = requests.post(url, headers=headers, json=body, timeout=8)
         return r.status_code, r.text[:4000]
@@ -208,22 +214,16 @@ def rest_ltp_order_service(token, exchange, jwt_token):
         return None, f"EXC: {e}"
 
 def rest_ltp_marketdata(token, exchange, jwt_token):
-    """
-    Try GET /rest/marketdata/ltp/v1?exchange=...&symboltoken=...
-    """
     try:
         path = f"/rest/marketdata/ltp/v1?exchange={exchange}&symboltoken={token}" if exchange else f"/rest/marketdata/ltp/v1?symboltoken={token}"
         url = BASE_API_HOST.rstrip("/") + path
-        headers = {"Authorization": f"Bearer {jwt_token}"} if jwt_token else {}
+        headers = api_headers(jwt_token)
         r = requests.get(url, headers=headers, timeout=8)
         return r.status_code, r.text[:4000]
     except Exception as e:
         return None, f"EXC: {e}"
 
 def get_ltp(info, jwt_token=None):
-    """
-    Try SDK first; if that fails try multiple REST endpoints and return parsed JSON or None
-    """
     # SDK attempts
     try:
         if hasattr(s, "getLtp"):
@@ -235,41 +235,41 @@ def get_ltp(info, jwt_token=None):
     except Exception:
         logger.debug("SDK get_ltp failed", exc_info=True)
 
-    # REST attempts (only if jwt provided)
+    # REST attempts (with API key header)
     if not jwt_token:
         logger.debug("No JWT for REST LTP fallback")
         return None
 
     token = info.get("token") if isinstance(info, dict) else info
-    exchange = info.get("exchange") if isinstance(info, dict) else None
+    exchange = info.get("exchange") if isinstance(info, dict) else ""
 
-    # 1) Try order-service POST
-    st, body = rest_ltp_order_service(token, exchange or "", jwt_token)
-    logger.debug("order-service LTP attempt status=%s body[0:300]=%s", st, body[:300])
-    # if looks like JSON with price, return parsed JSON
+    st, body = rest_ltp_order_service(token, exchange, jwt_token)
+    logger.debug("order-service attempt status=%s body[:300]=%s", st, body[:300])
     try:
         if st and st >= 200 and "{" in body:
             parsed = json.loads(body)
+            # detect invalid API Key in response
+            if isinstance(parsed, dict) and parsed.get("message") and "Invalid API Key" in str(parsed.get("message")):
+                telegram_send_text("❌ REST returned Invalid API Key. Check SMARTAPI_API_KEY in .env.")
             return parsed
     except Exception:
-        logger.debug("order-service response not JSON or parse failed", exc_info=True)
+        logger.debug("order-service parse failed", exc_info=True)
 
-    # 2) Try marketdata GET
-    st2, body2 = rest_ltp_marketdata(token, exchange or "", jwt_token)
-    logger.debug("marketdata LTP attempt status=%s body[0:300]=%s", st2, body2[:300])
+    st2, body2 = rest_ltp_marketdata(token, exchange, jwt_token)
+    logger.debug("marketdata attempt status=%s body[:300]=%s", st2, body2[:300])
     try:
         if st2 and st2 >= 200 and "{" in body2:
             parsed2 = json.loads(body2)
+            if isinstance(parsed2, dict) and parsed2.get("message") and "Invalid API Key" in str(parsed2.get("message")):
+                telegram_send_text("❌ REST returned Invalid API Key. Check SMARTAPI_API_KEY in .env.")
             return parsed2
     except Exception:
-        logger.debug("marketdata response not JSON or parse failed", exc_info=True)
+        logger.debug("marketdata parse failed", exc_info=True)
 
-    # Nothing returned
     logger.warning("All REST LTP attempts failed for token=%s (status1=%s status2=%s)", token, st, st2)
     return None
 
 def extract_ltp_from_response(resp):
-    """Normalize common LTP shapes to float."""
     try:
         if resp is None:
             return None
@@ -279,7 +279,6 @@ def extract_ltp_from_response(resp):
             except Exception:
                 return None
         if isinstance(resp, dict):
-            # common patterns: {"data":{"lastPrice":...}} or {"data":[{"ltp":..}]}
             data = resp.get("data") or resp.get("result") or resp.get("ltp")
             if isinstance(data, dict):
                 for k in ("lastPrice","lp","LTP","ltp"):
@@ -302,7 +301,6 @@ def extract_ltp_from_response(resp):
                         return float(first)
                     except Exception:
                         pass
-            # top-level keys
             for k in ("lastPrice","lp","LTP","ltp"):
                 if k in resp:
                     try:
@@ -314,13 +312,12 @@ def extract_ltp_from_response(resp):
         logger.exception("extract_ltp_from_response failed")
         return None
 
-# ---------------- Phase1 polling loop ----------------
+# Poll loop
 def poll_ltp_loop(jwt_token):
     if not jwt_token:
         logger.error("No JWT token; aborting poll loop")
         return
 
-    # startup msg
     try:
         monitoring_list = ", ".join(list(INSTRUMENTS.keys()))
         telegram_send_text(f"📡 Bot online — Phase1 LTP alerts. Monitoring: {monitoring_list}\nPoll interval: {POLL_INTERVAL}s")
@@ -342,10 +339,14 @@ def poll_ltp_loop(jwt_token):
                 ltp = extract_ltp_from_response(resp)
                 prev = prev_ltps.get(name)
                 if ltp is None:
-                    # send brief diagnostic message with small excerpt of resp if any
                     resp_excerpt = str(resp)[:400] if resp is not None else "None"
-                    telegram_send_text(f"<b>{name}</b>\nSignal: NO_DATA\n{name}: Could not retrieve LTP (resp excerpt: {resp_excerpt})")
-                    logger.warning("%s: LTP None (resp=%s)", name, resp_excerpt)
+                    # special handling: invalid API key message -> instruct user
+                    if isinstance(resp, dict) and resp.get("message") and "Invalid API Key" in str(resp.get("message")):
+                        telegram_send_text(f"❌ {name}: REST response indicates Invalid API Key. Please set SMARTAPI_API_KEY in .env to your AngelOne Private/API key and redeploy.")
+                        logger.error("Invalid API Key detected in REST response")
+                    else:
+                        telegram_send_text(f"<b>{name}</b>\nSignal: NO_DATA\n{name}: Could not retrieve LTP (resp excerpt: {resp_excerpt})")
+                        logger.warning("%s: LTP None (resp=%s)", name, resp_excerpt)
                 else:
                     delta = None
                     pct = None
@@ -372,12 +373,12 @@ def poll_ltp_loop(jwt_token):
         logger.info("Cycle complete; sleeping %s seconds", POLL_INTERVAL)
         time.sleep(POLL_INTERVAL)
 
-# ---------------- main ----------------
+# Main
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram vars missing; alerts will not be sent")
 
-    # 1) Resolve instruments tokens
+    # resolve instruments
     try:
         resolved = resolve_instruments_from_master()
         if resolved:
@@ -390,11 +391,11 @@ if __name__ == "__main__":
     except Exception:
         logger.exception("resolve_instruments_from_master failed")
 
-    # 2) Single startup login
+    # login
     resp, jwt_token = login()
     if not resp or not jwt_token:
         logger.error("Startup login failed. Check credentials and TOTP. Exiting.")
         sys.exit(1)
 
-    # 3) Start poll loop
+    # start loop
     poll_ltp_loop(jwt_token)
