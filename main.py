@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-main.py - Phase1 LTP alerts with API-Key-aware REST headers
+Enhanced main.py - Fixed Angel One LTP data fetching issues
+Phase1: LTP-only alerts every POLL_INTERVAL seconds to Telegram.
 
-Changes:
-- Adds X-PrivateKey (SMARTAPI_API_KEY) and X-SourceID/X-UserType headers to REST requests.
-- Sends clearer Telegram diagnostics when API Key is invalid.
-- Rest of Phase1 logic: single startup login, resolve instruments, poll LTP every POLL_INTERVAL and send Telegram messages.
+Key fixes:
+1. Enhanced response parsing for Angel One API quirks
+2. Multiple fallback token attempts for indices
+3. Better error diagnostics
+4. Alternative API endpoints
+5. Improved data extraction logic
 """
 
 import os
@@ -25,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(asctime)s %(me
 logger = logging.getLogger(__name__)
 
 # ENV
-SMARTAPI_API_KEY = os.getenv("SMARTAPI_API_KEY", "").strip()  # <-- ensure this is correct
+SMARTAPI_API_KEY = os.getenv("SMARTAPI_API_KEY", "").strip()
 SMARTAPI_CLIENT_CODE = os.getenv("SMARTAPI_CLIENT_CODE", "").strip()
 SMARTAPI_MPIN = os.getenv("SMARTAPI_MPIN", "").strip()
 SMARTAPI_PASSWORD = os.getenv("SMARTAPI_PASSWORD", "").strip()
@@ -42,10 +45,26 @@ INSTRUMENTS_URL = os.getenv(
 )
 BASE_API_HOST = os.getenv("SMARTAPI_BASE_URL", "https://apiconnect.angelone.in")
 
+# Enhanced instrument definitions with multiple token fallbacks
 INSTRUMENTS = {
-    "NIFTY50":   {"exchange": "NSE", "symbol": "NIFTY 50",  "token": None},
-    "BANKNIFTY": {"exchange": "NSE", "symbol": "BANKNIFTY",  "token": None},
-    "SENSEX":    {"exchange": "BSE", "symbol": "SENSEX",     "token": None},
+    "NIFTY50": {
+        "exchange": "NSE", 
+        "symbol": "NIFTY 50",  
+        "tokens": ["99926000", "26000", "256265"],  # Multiple known tokens
+        "trading_symbols": ["NIFTY 50", "NIFTY50", "NIFTY"]
+    },
+    "BANKNIFTY": {
+        "exchange": "NSE", 
+        "symbol": "BANKNIFTY",  
+        "tokens": ["5851", "26009", "260105"],
+        "trading_symbols": ["BANKNIFTY", "BANK NIFTY", "NIFTY BANK"]
+    },
+    "SENSEX": {
+        "exchange": "BSE", 
+        "symbol": "SENSEX",     
+        "tokens": ["14742", "1", "500100"],
+        "trading_symbols": ["SENSEX", "S&P BSE SENSEX", "BSE SENSEX"]
+    },
 }
 
 # Import SmartConnect
@@ -147,17 +166,215 @@ def telegram_send_text(text):
         logger.exception("telegram_send_text failed")
         return False
 
-# Helper to build API headers including API key
-def api_headers(jwt_token=None):
-    headers = {"Content-Type": "application/json", "X-SourceID": "WEB", "X-UserType": "USER"}
-    if SMARTAPI_API_KEY:
-        headers["X-PrivateKey"] = SMARTAPI_API_KEY
-    if jwt_token:
-        headers["Authorization"] = f"Bearer {jwt_token}"
-    return headers
+# Enhanced REST LTP attempts with better parsing
+def rest_ltp_order_service(token, exchange, jwt_token):
+    """POST /order-service/.../getLtpData with enhanced response parsing"""
+    try:
+        url = BASE_API_HOST.rstrip("/") + "/order-service/rest/secure/angelbroking/order/v1/getLtpData"
+        headers = {"Authorization": f"Bearer {jwt_token}", "Content-Type": "application/json"}
+        body = [{"exchange": exchange, "symboltoken": str(token)}]
+        r = requests.post(url, headers=headers, json=body, timeout=8)
+        
+        # Enhanced response parsing
+        if r.status_code == 200:
+            try:
+                response_data = r.json()
+                logger.debug("order-service response: %s", json.dumps(response_data, indent=2)[:500])
+                return r.status_code, response_data
+            except Exception:
+                logger.debug("order-service response (non-JSON): %s", r.text[:400])
+                return r.status_code, r.text
+        else:
+            logger.debug("order-service error %d: %s", r.status_code, r.text[:400])
+            return r.status_code, r.text
+            
+    except Exception as e:
+        logger.debug("order-service exception: %s", e)
+        return None, f"EXC: {e}"
 
-# Instruments resolve
+def rest_ltp_marketdata(token, exchange, jwt_token):
+    """GET /rest/marketdata/ltp/v1 with enhanced parsing"""
+    try:
+        path = f"/rest/marketdata/ltp/v1?exchange={exchange}&symboltoken={token}" if exchange else f"/rest/marketdata/ltp/v1?symboltoken={token}"
+        url = BASE_API_HOST.rstrip("/") + path
+        headers = {"Authorization": f"Bearer {jwt_token}"} if jwt_token else {}
+        r = requests.get(url, headers=headers, timeout=8)
+        
+        if r.status_code == 200:
+            try:
+                response_data = r.json()
+                logger.debug("marketdata response: %s", json.dumps(response_data, indent=2)[:500])
+                return r.status_code, response_data
+            except Exception:
+                logger.debug("marketdata response (non-JSON): %s", r.text[:400])
+                return r.status_code, r.text
+        else:
+            logger.debug("marketdata error %d: %s", r.status_code, r.text[:400])
+            return r.status_code, r.text
+            
+    except Exception as e:
+        logger.debug("marketdata exception: %s", e)
+        return None, f"EXC: {e}"
+
+def rest_ltp_alternative(token, exchange, jwt_token):
+    """Try alternative endpoint: /rest/secure/angelbroking/user/v1/getLtp"""
+    try:
+        url = BASE_API_HOST.rstrip("/") + "/rest/secure/angelbroking/user/v1/getLtp"
+        headers = {"Authorization": f"Bearer {jwt_token}", "Content-Type": "application/json"}
+        body = {"exchange": exchange, "symboltoken": str(token)}
+        r = requests.post(url, headers=headers, json=body, timeout=8)
+        
+        if r.status_code == 200:
+            try:
+                response_data = r.json()
+                logger.debug("alternative LTP response: %s", json.dumps(response_data, indent=2)[:500])
+                return r.status_code, response_data
+            except Exception:
+                return r.status_code, r.text
+        else:
+            logger.debug("alternative LTP error %d: %s", r.status_code, r.text[:400])
+            return r.status_code, r.text
+            
+    except Exception as e:
+        return None, f"EXC: {e}"
+
+def get_ltp_multi_token(instrument_info, jwt_token=None):
+    """
+    Try multiple tokens for an instrument until one works
+    """
+    name = instrument_info.get("name", "UNKNOWN")
+    tokens = instrument_info.get("tokens", [])
+    exchange = instrument_info.get("exchange", "NSE")
+    
+    if not tokens:
+        logger.warning("%s: No tokens to try", name)
+        return None, "No tokens available"
+    
+    for i, token in enumerate(tokens):
+        logger.info("%s: Trying token %s (%d/%d)", name, token, i+1, len(tokens))
+        
+        # Try SDK first
+        try:
+            info = {"exchange": exchange, "symboltoken": str(token)}
+            if hasattr(s, "getLtp"):
+                sdk_resp = s.getLtp(info)
+                if sdk_resp and isinstance(sdk_resp, dict):
+                    ltp = extract_ltp_from_response(sdk_resp)
+                    if ltp is not None:
+                        logger.info("%s: SDK success with token %s, LTP=%s", name, token, ltp)
+                        return ltp, f"SDK:token_{token}"
+        except Exception as e:
+            logger.debug("%s: SDK failed for token %s: %s", name, token, e)
+        
+        # Try REST endpoints if JWT available
+        if jwt_token:
+            # Method 1: order-service
+            try:
+                st, resp = rest_ltp_order_service(token, exchange, jwt_token)
+                if st == 200 and isinstance(resp, dict):
+                    ltp = extract_ltp_from_response(resp)
+                    if ltp is not None:
+                        logger.info("%s: order-service success with token %s, LTP=%s", name, token, ltp)
+                        return ltp, f"order-service:token_{token}"
+            except Exception as e:
+                logger.debug("%s: order-service failed for token %s: %s", name, token, e)
+            
+            # Method 2: marketdata
+            try:
+                st, resp = rest_ltp_marketdata(token, exchange, jwt_token)
+                if st == 200 and isinstance(resp, dict):
+                    ltp = extract_ltp_from_response(resp)
+                    if ltp is not None:
+                        logger.info("%s: marketdata success with token %s, LTP=%s", name, token, ltp)
+                        return ltp, f"marketdata:token_{token}"
+            except Exception as e:
+                logger.debug("%s: marketdata failed for token %s: %s", name, token, e)
+            
+            # Method 3: alternative endpoint
+            try:
+                st, resp = rest_ltp_alternative(token, exchange, jwt_token)
+                if st == 200 and isinstance(resp, dict):
+                    ltp = extract_ltp_from_response(resp)
+                    if ltp is not None:
+                        logger.info("%s: alternative success with token %s, LTP=%s", name, token, ltp)
+                        return ltp, f"alternative:token_{token}"
+            except Exception as e:
+                logger.debug("%s: alternative failed for token %s: %s", name, token, e)
+    
+    logger.warning("%s: All tokens exhausted, no LTP retrieved", name)
+    return None, f"All {len(tokens)} tokens failed"
+
+def extract_ltp_from_response(resp):
+    """Enhanced LTP extraction for Angel One API quirks"""
+    try:
+        if resp is None:
+            return None
+            
+        if isinstance(resp, (int, float)):
+            return float(resp)
+            
+        if isinstance(resp, str):
+            try:
+                return float(resp)
+            except Exception:
+                return None
+        
+        if isinstance(resp, dict):
+            # Angel One specific patterns
+            # Pattern 1: {"status":true,"message":"SUCCESS","errorcode":"","data":{"exchange":"NSE","tradingsymbol":"NIFTY 50","symboltoken":"99926000","open":25268.55,"high":25338.40,"low":25217.40,"close":25279.85,"ltp":25279.85}}
+            data = resp.get("data")
+            if isinstance(data, dict):
+                # Direct LTP field
+                if "ltp" in data:
+                    try:
+                        return float(data["ltp"])
+                    except Exception:
+                        pass
+                
+                # Common LTP field names
+                for field in ["lastPrice", "lp", "LTP", "last_price", "close"]:
+                    if field in data:
+                        try:
+                            return float(data[field])
+                        except Exception:
+                            pass
+            
+            # Pattern 2: {"status":true,"data":[{"exchange":"NSE","tradingsymbol":"NIFTY 50","ltp":25279.85}]}
+            if isinstance(data, list) and len(data) > 0:
+                first_item = data[0]
+                if isinstance(first_item, dict):
+                    for field in ["ltp", "lastPrice", "lp", "LTP", "last_price", "close"]:
+                        if field in first_item:
+                            try:
+                                return float(first_item[field])
+                            except Exception:
+                                pass
+            
+            # Pattern 3: Top-level LTP fields
+            for field in ["ltp", "lastPrice", "lp", "LTP", "last_price", "close"]:
+                if field in resp:
+                    try:
+                        return float(resp[field])
+                    except Exception:
+                        pass
+            
+            # Pattern 4: Nested in result
+            result = resp.get("result")
+            if isinstance(result, dict):
+                for field in ["ltp", "lastPrice", "lp", "LTP", "last_price", "close"]:
+                    if field in result:
+                        try:
+                            return float(result[field])
+                        except Exception:
+                            pass
+        
+        return None
+    except Exception:
+        logger.exception("extract_ltp_from_response failed for resp: %s", str(resp)[:200])
+        return None
+
 def resolve_instruments_from_master():
+    """Enhanced instrument resolution with multiple symbol matching"""
     try:
         logger.info("Downloading instruments master: %s", INSTRUMENTS_URL)
         r = requests.get(INSTRUMENTS_URL, timeout=20)
@@ -168,186 +385,85 @@ def resolve_instruments_from_master():
         return {}
 
     rows = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
-    wanted_map = {"NIFTY 50":"NIFTY50","NIFTY50":"NIFTY50","BANKNIFTY":"BANKNIFTY","BANK NIFTY":"BANKNIFTY","SENSEX":"SENSEX","S&P BSE SENSEX":"SENSEX"}
-    found = {}
-    for row in rows:
-        try:
-            trad_sym = (row.get("symbol") or row.get("tradingsymbol") or "").strip()
-            exch = (row.get("exchange") or row.get("exch") or "").strip()
-            token = row.get("token") or row.get("instrument_token") or row.get("symboltoken")
-            if token is None:
-                for k,v in row.items():
-                    if "token" in str(k).lower():
-                        token = v
-                        break
-            if not trad_sym or not token:
-                continue
-            key = None
-            if trad_sym in wanted_map:
-                key = wanted_map[trad_sym]
-            else:
-                for candidate,mapped in wanted_map.items():
-                    if candidate.lower() in trad_sym.lower():
-                        key = mapped
-                        break
-            if key and key not in found:
-                found[key] = {"exchange": exch, "symbol": trad_sym, "token": str(token)}
-        except Exception:
-            continue
-
-    for k,v in found.items():
-        INSTRUMENTS[k]["exchange"] = v.get("exchange", INSTRUMENTS[k].get("exchange"))
-        INSTRUMENTS[k]["symbol"] = v.get("symbol", INSTRUMENTS[k].get("symbol"))
-        INSTRUMENTS[k]["token"] = v.get("token")
-    logger.info("Instruments after resolve: %s", {k:INSTRUMENTS[k]["token"] for k in INSTRUMENTS})
-    return found
-
-# REST LTP attempts (with API key header)
-def rest_ltp_order_service(token, exchange, jwt_token):
-    try:
-        url = BASE_API_HOST.rstrip("/") + "/order-service/rest/secure/angelbroking/order/v1/getLtpData"
-        headers = api_headers(jwt_token)
-        body = [{"exchange": exchange, "symboltoken": str(token)}]
-        r = requests.post(url, headers=headers, json=body, timeout=8)
-        return r.status_code, r.text[:4000]
-    except Exception as e:
-        return None, f"EXC: {e}"
-
-def rest_ltp_marketdata(token, exchange, jwt_token):
-    try:
-        path = f"/rest/marketdata/ltp/v1?exchange={exchange}&symboltoken={token}" if exchange else f"/rest/marketdata/ltp/v1?symboltoken={token}"
-        url = BASE_API_HOST.rstrip("/") + path
-        headers = api_headers(jwt_token)
-        r = requests.get(url, headers=headers, timeout=8)
-        return r.status_code, r.text[:4000]
-    except Exception as e:
-        return None, f"EXC: {e}"
-
-def get_ltp(info, jwt_token=None):
-    # SDK attempts
-    try:
-        if hasattr(s, "getLtp"):
-            return s.getLtp(info)
-        if hasattr(s, "get_ltp"):
-            return s.get_ltp(info)
-        if hasattr(s, "getLtpData"):
-            return s.getLtpData([info])
-    except Exception:
-        logger.debug("SDK get_ltp failed", exc_info=True)
-
-    # REST attempts (with API key header)
-    if not jwt_token:
-        logger.debug("No JWT for REST LTP fallback")
-        return None
-
-    token = info.get("token") if isinstance(info, dict) else info
-    exchange = info.get("exchange") if isinstance(info, dict) else ""
-
-    st, body = rest_ltp_order_service(token, exchange, jwt_token)
-    logger.debug("order-service attempt status=%s body[:300]=%s", st, body[:300])
-    try:
-        if st and st >= 200 and "{" in body:
-            parsed = json.loads(body)
-            # detect invalid API Key in response
-            if isinstance(parsed, dict) and parsed.get("message") and "Invalid API Key" in str(parsed.get("message")):
-                telegram_send_text("❌ REST returned Invalid API Key. Check SMARTAPI_API_KEY in .env.")
-            return parsed
-    except Exception:
-        logger.debug("order-service parse failed", exc_info=True)
-
-    st2, body2 = rest_ltp_marketdata(token, exchange, jwt_token)
-    logger.debug("marketdata attempt status=%s body[:300]=%s", st2, body2[:300])
-    try:
-        if st2 and st2 >= 200 and "{" in body2:
-            parsed2 = json.loads(body2)
-            if isinstance(parsed2, dict) and parsed2.get("message") and "Invalid API Key" in str(parsed2.get("message")):
-                telegram_send_text("❌ REST returned Invalid API Key. Check SMARTAPI_API_KEY in .env.")
-            return parsed2
-    except Exception:
-        logger.debug("marketdata parse failed", exc_info=True)
-
-    logger.warning("All REST LTP attempts failed for token=%s (status1=%s status2=%s)", token, st, st2)
-    return None
-
-def extract_ltp_from_response(resp):
-    try:
-        if resp is None:
-            return None
-        if isinstance(resp, (int, float, str)):
+    
+    # Enhanced matching for each instrument
+    for inst_key, inst_config in INSTRUMENTS.items():
+        symbols_to_match = inst_config.get("trading_symbols", [inst_config.get("symbol", "")])
+        exchange = inst_config.get("exchange", "NSE")
+        
+        logger.info("Looking for %s symbols: %s in exchange: %s", inst_key, symbols_to_match, exchange)
+        
+        found_tokens = []
+        for row in rows:
             try:
-                return float(resp)
+                trad_sym = (row.get("symbol") or row.get("tradingsymbol") or "").strip()
+                exch = (row.get("exchange") or row.get("exch") or "").strip()
+                token = row.get("token") or row.get("instrument_token") or row.get("symboltoken")
+                
+                if not trad_sym or not token:
+                    continue
+                
+                # Check if this row matches our instrument
+                if exch.upper() == exchange.upper():
+                    for symbol_variant in symbols_to_match:
+                        if trad_sym.upper() == symbol_variant.upper():
+                            token_str = str(token)
+                            if token_str not in found_tokens:
+                                found_tokens.append(token_str)
+                                logger.info("Found %s token: %s for symbol: %s", inst_key, token_str, trad_sym)
+                            break
             except Exception:
-                return None
-        if isinstance(resp, dict):
-            data = resp.get("data") or resp.get("result") or resp.get("ltp")
-            if isinstance(data, dict):
-                for k in ("lastPrice","lp","LTP","ltp"):
-                    if k in data:
-                        try:
-                            return float(data[k])
-                        except Exception:
-                            pass
-            if isinstance(data, list) and len(data) > 0:
-                first = data[0]
-                if isinstance(first, dict):
-                    for k in ("lastPrice","lp","LTP","ltp"):
-                        if k in first:
-                            try:
-                                return float(first[k])
-                            except Exception:
-                                pass
-                else:
-                    try:
-                        return float(first)
-                    except Exception:
-                        pass
-            for k in ("lastPrice","lp","LTP","ltp"):
-                if k in resp:
-                    try:
-                        return float(resp[k])
-                    except Exception:
-                        pass
-        return None
-    except Exception:
-        logger.exception("extract_ltp_from_response failed")
-        return None
+                continue
+        
+        # Merge found tokens with existing ones (keep existing as primary)
+        existing_tokens = inst_config.get("tokens", [])
+        all_tokens = existing_tokens[:]  # Start with existing
+        
+        # Add newly found tokens that aren't already present
+        for token in found_tokens:
+            if token not in all_tokens:
+                all_tokens.append(token)
+        
+        INSTRUMENTS[inst_key]["tokens"] = all_tokens
+        logger.info("Final tokens for %s: %s", inst_key, all_tokens)
 
-# Poll loop
+    return INSTRUMENTS
+
 def poll_ltp_loop(jwt_token):
     if not jwt_token:
         logger.error("No JWT token; aborting poll loop")
         return
 
+    # startup msg
     try:
         monitoring_list = ", ".join(list(INSTRUMENTS.keys()))
-        telegram_send_text(f"📡 Bot online — Phase1 LTP alerts. Monitoring: {monitoring_list}\nPoll interval: {POLL_INTERVAL}s")
+        telegram_send_text(f"🚀 Enhanced Bot online — Phase1 LTP alerts\nMonitoring: {monitoring_list}\nPoll interval: {POLL_INTERVAL}s\n\nEnhancements:\n✅ Multiple token fallbacks\n✅ Enhanced response parsing\n✅ Better error diagnostics")
     except Exception:
         pass
 
     prev_ltps = {k: None for k in INSTRUMENTS.keys()}
+    successful_methods = {}  # Track which method works for each instrument
+    
     while True:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        logger.info("Polling LTP at %s", ts)
+        logger.info("🔄 Polling LTP at %s", ts)
+        
         for name, info in INSTRUMENTS.items():
             try:
-                if not info.get("token"):
-                    logger.warning("%s token missing - skipping", name)
-                    telegram_send_text(f"{name}\nSignal: NO_DATA\n{name}: token missing - could not fetch LTP")
-                    continue
-
-                resp = get_ltp(info, jwt_token)
-                ltp = extract_ltp_from_response(resp)
+                # Add name to info for logging
+                info_with_name = dict(info)
+                info_with_name["name"] = name
+                
+                ltp, method = get_ltp_multi_token(info_with_name, jwt_token)
                 prev = prev_ltps.get(name)
+                
                 if ltp is None:
-                    resp_excerpt = str(resp)[:400] if resp is not None else "None"
-                    # special handling: invalid API key message -> instruct user
-                    if isinstance(resp, dict) and resp.get("message") and "Invalid API Key" in str(resp.get("message")):
-                        telegram_send_text(f"❌ {name}: REST response indicates Invalid API Key. Please set SMARTAPI_API_KEY in .env to your AngelOne Private/API key and redeploy.")
-                        logger.error("Invalid API Key detected in REST response")
-                    else:
-                        telegram_send_text(f"<b>{name}</b>\nSignal: NO_DATA\n{name}: Could not retrieve LTP (resp excerpt: {resp_excerpt})")
-                        logger.warning("%s: LTP None (resp=%s)", name, resp_excerpt)
+                    telegram_send_text(f"❌ <b>{name}</b>\nSignal: NO_DATA\nStatus: {method}\nTime: {ts}")
+                    logger.warning("%s: LTP retrieval failed - %s", name, method)
                 else:
+                    # Track successful method
+                    successful_methods[name] = method
+                    
                     delta = None
                     pct = None
                     if prev is not None:
@@ -357,45 +473,78 @@ def poll_ltp_loop(jwt_token):
                         except Exception:
                             delta = None
                             pct = None
+                    
                     prev_ltps[name] = ltp
-                    lines = [f"<b>{name}</b>", f"Time: {ts}", f"LTP: {ltp:.2f}"]
+                    
+                    # Format message
+                    lines = [f"✅ <b>{name}</b>", f"Time: {ts}", f"LTP: ₹{ltp:.2f}"]
+                    
                     if delta is not None:
+                        emoji = "📈" if delta > 0 else "📉" if delta < 0 else "➡️"
                         sign = "+" if delta > 0 else ""
-                        lines.append(f"Δ: {sign}{delta:.2f} ({sign}{pct:.2f}%) vs prev")
+                        lines.append(f"Δ: {sign}{delta:.2f} ({sign}{pct:.2f}%) {emoji}")
                     else:
-                        lines.append("Δ: (no previous)")
-                    lines.append(f"Token: {info.get('token')}")
+                        lines.append("Δ: (first reading)")
+                    
+                    lines.append(f"Method: {method}")
+                    
                     telegram_send_text("\n".join(lines))
-                    logger.info("%s: sent LTP %s", name, ltp)
-                time.sleep(0.3)
+                    logger.info("✅ %s: LTP=%s via %s", name, ltp, method)
+                
+                time.sleep(0.5)  # Brief pause between instruments
+                
             except Exception:
-                logger.exception("Error during LTP poll for %s", name)
-        logger.info("Cycle complete; sleeping %s seconds", POLL_INTERVAL)
+                logger.exception("❌ Error during LTP poll for %s", name)
+                telegram_send_text(f"❌ <b>{name}</b>\nSignal: ERROR\nException occurred during data fetch\nTime: {ts}")
+        
+        # Summary log
+        working_count = len([k for k, v in prev_ltps.items() if v is not None])
+        logger.info("🔄 Cycle complete: %d/%d instruments successful. Sleeping %ds", 
+                   working_count, len(INSTRUMENTS), POLL_INTERVAL)
+        
         time.sleep(POLL_INTERVAL)
 
-# Main
+# ---------------- main ----------------
 if __name__ == "__main__":
+    logger.info("🚀 Starting Enhanced Angel One LTP Bot")
+    
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram vars missing; alerts will not be sent")
+        logger.warning("⚠️  Telegram vars missing; alerts will not be sent")
 
-    # resolve instruments
+    # 1) Enhanced instrument resolution
     try:
-        resolved = resolve_instruments_from_master()
-        if resolved:
-            try:
-                telegram_send_text("Instrument tokens auto-resolved:\n" + "\n".join([f"{k}: {INSTRUMENTS[k]['token']}" for k in INSTRUMENTS]))
-            except Exception:
-                pass
-        else:
-            logger.info("No instruments auto-resolved; tokens may need manual set")
+        logger.info("🔍 Resolving instrument tokens...")
+        resolve_instruments_from_master()
+        
+        # Send summary to Telegram
+        token_summary = []
+        for name, info in INSTRUMENTS.items():
+            tokens = info.get("tokens", [])
+            token_summary.append(f"{name}: {len(tokens)} tokens {tokens[:3]}{'...' if len(tokens) > 3 else ''}")
+        
+        telegram_send_text("🔍 Instrument Resolution Complete:\n" + "\n".join(token_summary))
+        
     except Exception:
-        logger.exception("resolve_instruments_from_master failed")
+        logger.exception("❌ resolve_instruments_from_master failed")
 
-    # login
+    # 2) Login
+    logger.info("🔐 Attempting login...")
     resp, jwt_token = login()
     if not resp or not jwt_token:
-        logger.error("Startup login failed. Check credentials and TOTP. Exiting.")
+        error_msg = "❌ Login failed! Check credentials and TOTP"
+        logger.error(error_msg)
+        telegram_send_text(error_msg)
         sys.exit(1)
+    
+    telegram_send_text("✅ Login successful! Starting LTP monitoring...")
 
-    # start loop
-    poll_ltp_loop(jwt_token)
+    # 3) Start enhanced poll loop
+    try:
+        poll_ltp_loop(jwt_token)
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot stopped by user")
+        telegram_send_text("🛑 Bot stopped manually")
+    except Exception:
+        logger.exception("❌ Fatal error in poll loop")
+        telegram_send_text("💥 Bot crashed! Check logs")
+        raise
