@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Phase 1 main.py
-- Single startup login (MPIN+TOTP preferred)
-- Auto-resolve NIFTY50, BANKNIFTY, SENSEX tokens from AngelOne master JSON
-- Poll LTP every POLL_INTERVAL seconds (default 60s)
-- Send formatted Telegram message per symbol each poll (includes delta vs previous)
+Updated main.py - enhanced REST LTP attempts (multiple endpoints) + diagnostics
+Phase1: LTP-only alerts every POLL_INTERVAL seconds to Telegram.
+
+Replace your existing main.py with this file and deploy.
+Ensure .env contains: SMARTAPI_CLIENT_CODE, SMARTAPI_MPIN (or SMARTAPI_PASSWORD),
+SMARTAPI_TOTP_SECRET, SMARTAPI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 
 import os
@@ -33,26 +34,21 @@ SMARTAPI_TOTP_SECRET = os.getenv("SMARTAPI_TOTP_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# default poll interval (1 minute for Phase 1)
 POLL_INTERVAL = int(os.getenv("MARKET_POLL_INTERVAL_SECONDS", "60"))
 
-# Instruments master URL (AngelOne docs)
 INSTRUMENTS_URL = os.getenv(
     "INSTRUMENTS_URL",
     "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
 )
-
-# Base API host for REST fallback (AngelOne)
 BASE_API_HOST = os.getenv("SMARTAPI_BASE_URL", "https://apiconnect.angelone.in")
 
-# Default instruments (token None -> will try to auto-resolve from master)
 INSTRUMENTS = {
     "NIFTY50":   {"exchange": "NSE", "symbol": "NIFTY 50",  "token": None},
     "BANKNIFTY": {"exchange": "NSE", "symbol": "BANKNIFTY",  "token": None},
     "SENSEX":    {"exchange": "BSE", "symbol": "SENSEX",     "token": None},
 }
 
-# Import SmartConnect from whichever package is installed
+# Import SmartConnect
 SmartConnect = None
 for candidate in ("smartapi", "SmartApi", "smartapi_python"):
     try:
@@ -69,7 +65,7 @@ for candidate in ("smartapi", "SmartApi", "smartapi_python"):
         continue
 
 if SmartConnect is None:
-    logger.error("SmartConnect import failed. Install 'smartapi-python' and ensure package present.")
+    logger.error("SmartConnect import failed. Install 'smartapi-python'.")
     sys.exit(1)
 
 # instantiate SmartConnect
@@ -110,7 +106,7 @@ def _extract_jwt_from_resp(resp):
         return None
 
 def login():
-    """Attempt MPIN+TOTP first, then password+TOTP fallback."""
+    """Try MPIN+TOTP first, then password fallback."""
     if SMARTAPI_MPIN and SMARTAPI_TOTP_SECRET:
         code = totp_now(SMARTAPI_TOTP_SECRET)
         try:
@@ -133,10 +129,10 @@ def login():
         except Exception as e:
             logger.warning("Password login exception: %s", e)
             logger.debug(traceback.format_exc())
-    logger.error("No valid credentials for login found (MPIN/password/TOTP).")
+    logger.error("No valid credentials for login found.")
     return None, None
 
-# Telegram helpers
+# Telegram helper
 def telegram_send_text(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram creds missing; skipping telegram_send_text")
@@ -151,7 +147,7 @@ def telegram_send_text(text):
         logger.exception("telegram_send_text failed")
         return False
 
-# Instruments master resolve
+# ---------------- Instruments resolve (best-effort) ----------------
 def resolve_instruments_from_master():
     try:
         logger.info("Downloading instruments master: %s", INSTRUMENTS_URL)
@@ -162,21 +158,8 @@ def resolve_instruments_from_master():
         logger.exception("Failed to download instruments master")
         return {}
 
-    rows = []
-    if isinstance(data, list):
-        rows = data
-    elif isinstance(data, dict) and isinstance(data.get("data"), list):
-        rows = data.get("data")
-    else:
-        logger.warning("Unexpected master format: %s", type(data))
-        return {}
-
-    wanted_map = {
-        "NIFTY 50": "NIFTY50", "NIFTY50": "NIFTY50",
-        "BANKNIFTY": "BANKNIFTY", "BANK NIFTY": "BANKNIFTY",
-        "SENSEX": "SENSEX", "S&P BSE SENSEX": "SENSEX"
-    }
-
+    rows = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+    wanted_map = {"NIFTY 50":"NIFTY50","NIFTY50":"NIFTY50","BANKNIFTY":"BANKNIFTY","BANK NIFTY":"BANKNIFTY","SENSEX":"SENSEX","S&P BSE SENSEX":"SENSEX"}
     found = {}
     for row in rows:
         try:
@@ -194,7 +177,7 @@ def resolve_instruments_from_master():
             if trad_sym in wanted_map:
                 key = wanted_map[trad_sym]
             else:
-                for candidate, mapped in wanted_map.items():
+                for candidate,mapped in wanted_map.items():
                     if candidate.lower() in trad_sym.lower():
                         key = mapped
                         break
@@ -203,16 +186,45 @@ def resolve_instruments_from_master():
         except Exception:
             continue
 
-    for k, v in found.items():
+    for k,v in found.items():
         INSTRUMENTS[k]["exchange"] = v.get("exchange", INSTRUMENTS[k].get("exchange"))
         INSTRUMENTS[k]["symbol"] = v.get("symbol", INSTRUMENTS[k].get("symbol"))
         INSTRUMENTS[k]["token"] = v.get("token")
-
-    logger.info("Instruments after resolve: %s", {k: INSTRUMENTS[k]["token"] for k in INSTRUMENTS})
+    logger.info("Instruments after resolve: %s", {k:INSTRUMENTS[k]["token"] for k in INSTRUMENTS})
     return found
 
-# LTP retrieval (SDK-first, REST fallback)
+# ---------------- Enhanced REST LTP attempts ----------------
+def rest_ltp_order_service(token, exchange, jwt_token):
+    """
+    Try POST /order-service/.../getLtpData with body [{"exchange":"NSE","symboltoken":"..."}]
+    """
+    try:
+        url = BASE_API_HOST.rstrip("/") + "/order-service/rest/secure/angelbroking/order/v1/getLtpData"
+        headers = {"Authorization": f"Bearer {jwt_token}", "Content-Type": "application/json"}
+        body = [{"exchange": exchange, "symboltoken": str(token)}]
+        r = requests.post(url, headers=headers, json=body, timeout=8)
+        return r.status_code, r.text[:4000]
+    except Exception as e:
+        return None, f"EXC: {e}"
+
+def rest_ltp_marketdata(token, exchange, jwt_token):
+    """
+    Try GET /rest/marketdata/ltp/v1?exchange=...&symboltoken=...
+    """
+    try:
+        path = f"/rest/marketdata/ltp/v1?exchange={exchange}&symboltoken={token}" if exchange else f"/rest/marketdata/ltp/v1?symboltoken={token}"
+        url = BASE_API_HOST.rstrip("/") + path
+        headers = {"Authorization": f"Bearer {jwt_token}"} if jwt_token else {}
+        r = requests.get(url, headers=headers, timeout=8)
+        return r.status_code, r.text[:4000]
+    except Exception as e:
+        return None, f"EXC: {e}"
+
 def get_ltp(info, jwt_token=None):
+    """
+    Try SDK first; if that fails try multiple REST endpoints and return parsed JSON or None
+    """
+    # SDK attempts
     try:
         if hasattr(s, "getLtp"):
             return s.getLtp(info)
@@ -223,64 +235,75 @@ def get_ltp(info, jwt_token=None):
     except Exception:
         logger.debug("SDK get_ltp failed", exc_info=True)
 
+    # REST attempts (only if jwt provided)
     if not jwt_token:
         logger.debug("No JWT for REST LTP fallback")
         return None
+
+    token = info.get("token") if isinstance(info, dict) else info
+    exchange = info.get("exchange") if isinstance(info, dict) else None
+
+    # 1) Try order-service POST
+    st, body = rest_ltp_order_service(token, exchange or "", jwt_token)
+    logger.debug("order-service LTP attempt status=%s body[0:300]=%s", st, body[:300])
+    # if looks like JSON with price, return parsed JSON
     try:
-        if isinstance(info, dict):
-            exch = info.get("exchange")
-            token = info.get("token")
-            path = f"/rest/marketdata/ltp/v1?exchange={exch}&symboltoken={token}"
-        else:
-            path = f"/rest/marketdata/ltp/v1?symboltoken={info}"
-        url = BASE_API_HOST.rstrip("/") + path
-        headers = {"Authorization": f"Bearer {jwt_token}"}
-        r = requests.get(url, headers=headers, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        if st and st >= 200 and "{" in body:
+            parsed = json.loads(body)
+            return parsed
     except Exception:
-        logger.exception("REST LTP failed")
-        return None
+        logger.debug("order-service response not JSON or parse failed", exc_info=True)
+
+    # 2) Try marketdata GET
+    st2, body2 = rest_ltp_marketdata(token, exchange or "", jwt_token)
+    logger.debug("marketdata LTP attempt status=%s body[0:300]=%s", st2, body2[:300])
+    try:
+        if st2 and st2 >= 200 and "{" in body2:
+            parsed2 = json.loads(body2)
+            return parsed2
+    except Exception:
+        logger.debug("marketdata response not JSON or parse failed", exc_info=True)
+
+    # Nothing returned
+    logger.warning("All REST LTP attempts failed for token=%s (status1=%s status2=%s)", token, st, st2)
+    return None
 
 def extract_ltp_from_response(resp):
-    """
-    Normalize common LTP response shapes to scalar last price (float) or None
-    """
+    """Normalize common LTP shapes to float."""
     try:
         if resp is None:
             return None
         if isinstance(resp, (int, float, str)):
-            return float(resp)
+            try:
+                return float(resp)
+            except Exception:
+                return None
         if isinstance(resp, dict):
-            # common patterns
-            # resp may be { "data": {"lastPrice": 10000} } or { "data": [{"ltp":...}]} etc.
-            data = resp.get("data") or resp.get("ltp") or resp.get("result")
-            # if data is dict
+            # common patterns: {"data":{"lastPrice":...}} or {"data":[{"ltp":..}]}
+            data = resp.get("data") or resp.get("result") or resp.get("ltp")
             if isinstance(data, dict):
-                for k in ("lastPrice", "lp", "LTP", "ltp"):
+                for k in ("lastPrice","lp","LTP","ltp"):
                     if k in data:
                         try:
                             return float(data[k])
                         except Exception:
                             pass
-            # if data is list
             if isinstance(data, list) and len(data) > 0:
                 first = data[0]
                 if isinstance(first, dict):
-                    for k in ("lastPrice", "lp", "LTP", "ltp"):
+                    for k in ("lastPrice","lp","LTP","ltp"):
                         if k in first:
                             try:
                                 return float(first[k])
                             except Exception:
                                 pass
                 else:
-                    # maybe numeric
                     try:
                         return float(first)
                     except Exception:
                         pass
             # top-level keys
-            for k in ("lastPrice", "lp", "LTP", "ltp"):
+            for k in ("lastPrice","lp","LTP","ltp"):
                 if k in resp:
                     try:
                         return float(resp[k])
@@ -291,13 +314,13 @@ def extract_ltp_from_response(resp):
         logger.exception("extract_ltp_from_response failed")
         return None
 
-# Main polling loop for Phase 1 (LTP-only alerts)
+# ---------------- Phase1 polling loop ----------------
 def poll_ltp_loop(jwt_token):
     if not jwt_token:
-        logger.error("No JWT token provided to poll_ltp_loop; aborting")
+        logger.error("No JWT token; aborting poll loop")
         return
 
-    # send startup message
+    # startup msg
     try:
         monitoring_list = ", ".join(list(INSTRUMENTS.keys()))
         telegram_send_text(f"📡 Bot online — Phase1 LTP alerts. Monitoring: {monitoring_list}\nPoll interval: {POLL_INTERVAL}s")
@@ -315,15 +338,14 @@ def poll_ltp_loop(jwt_token):
                     telegram_send_text(f"{name}\nSignal: NO_DATA\n{name}: token missing - could not fetch LTP")
                     continue
 
-                # get LTP (sdk or REST)
                 resp = get_ltp(info, jwt_token)
                 ltp = extract_ltp_from_response(resp)
                 prev = prev_ltps.get(name)
-                # format message
                 if ltp is None:
-                    msg = f"<b>{name}</b>\nSignal: NO_DATA\n{name}: Could not retrieve LTP (response: {str(resp)[:200]})"
-                    telegram_send_text(msg)
-                    logger.warning("%s: LTP None (resp=%s)", name, str(resp)[:200])
+                    # send brief diagnostic message with small excerpt of resp if any
+                    resp_excerpt = str(resp)[:400] if resp is not None else "None"
+                    telegram_send_text(f"<b>{name}</b>\nSignal: NO_DATA\n{name}: Could not retrieve LTP (resp excerpt: {resp_excerpt})")
+                    logger.warning("%s: LTP None (resp=%s)", name, resp_excerpt)
                 else:
                     delta = None
                     pct = None
@@ -335,7 +357,6 @@ def poll_ltp_loop(jwt_token):
                             delta = None
                             pct = None
                     prev_ltps[name] = ltp
-                    # Build message
                     lines = [f"<b>{name}</b>", f"Time: {ts}", f"LTP: {ltp:.2f}"]
                     if delta is not None:
                         sign = "+" if delta > 0 else ""
@@ -343,24 +364,20 @@ def poll_ltp_loop(jwt_token):
                     else:
                         lines.append("Δ: (no previous)")
                     lines.append(f"Token: {info.get('token')}")
-                    msg = "\n".join(lines)
-                    telegram_send_text(msg)
+                    telegram_send_text("\n".join(lines))
                     logger.info("%s: sent LTP %s", name, ltp)
-                # small sleep between symbols to avoid hitting rate limits
                 time.sleep(0.3)
             except Exception:
                 logger.exception("Error during LTP poll for %s", name)
-        # end for symbols
         logger.info("Cycle complete; sleeping %s seconds", POLL_INTERVAL)
         time.sleep(POLL_INTERVAL)
 
-# Entrypoint
+# ---------------- main ----------------
 if __name__ == "__main__":
-    # Quick checks
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram vars missing; alerts will not be sent (set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID)")
+        logger.warning("Telegram vars missing; alerts will not be sent")
 
-    # 1) Auto-resolve instruments tokens from master (best-effort)
+    # 1) Resolve instruments tokens
     try:
         resolved = resolve_instruments_from_master()
         if resolved:
@@ -369,9 +386,9 @@ if __name__ == "__main__":
             except Exception:
                 pass
         else:
-            logger.info("No instruments auto-resolved; ensure INSTRUMENTS tokens exist or master URL accessible")
+            logger.info("No instruments auto-resolved; tokens may need manual set")
     except Exception:
-        logger.exception("resolve_instruments_from_master() failed")
+        logger.exception("resolve_instruments_from_master failed")
 
     # 2) Single startup login
     resp, jwt_token = login()
@@ -379,5 +396,5 @@ if __name__ == "__main__":
         logger.error("Startup login failed. Check credentials and TOTP. Exiting.")
         sys.exit(1)
 
-    # 3) Start Phase1 LTP poll loop (uses jwt_token)
+    # 3) Start poll loop
     poll_ltp_loop(jwt_token)
